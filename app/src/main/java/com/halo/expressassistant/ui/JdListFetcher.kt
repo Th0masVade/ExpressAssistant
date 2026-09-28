@@ -27,7 +27,37 @@ import org.json.JSONObject
 object JdListFetcher {
 
     private const val TAG = "JdListFetcher"
-    private const val ORDER_CENTER = "https://trade.m.jd.com/order/orderlist_jdm.shtml?orderType=all&source=m_outer_jx_order"
+
+    /* ★★ 2026-09-28 修复「新下的京东单同步不进来」（用户实测：4 个新单在云雀里完全看不到）。
+       ── 根因（读源码 + 实测数据得出，不是猜的）──
+       原来只有 `orderType=all` 一个入口，而终止条件是：
+           if ((total > 0 && orders.size >= total) || rounds > 14) finish()
+        `total` 取自响应体 body.totalNum = **账号下全部订单数**（实测这个账号几百单），
+        `orders.size` 每轮只多一页（10~20 条）→ `orders.size >= total` 几乎永不成立，
+        只能靠 `rounds > 14` 强制收工（14 × 3s ≈ 42 秒）。
+        ★ 而京东订单列表是**按时间倒序**，「已完成」的历史单排在前面 ——
+          42 秒全用来滚旧单，**新单还没滚到就被截断了**。
+        ★ 实测佐证：抓到的 20 条京东件**全部是 dealState=18（已完成）**，
+          且 latestText 只有「完成」二字（已完成单本来就没轨迹文案）。
+
+       ── 修法（两处一起改，缺一不可）──
+       ① 入口覆盖多个 tab：不再只抓 all，而是把「待收货 / 待出库 / 全部」逐个抓一遍。
+          ★ 为什么用「多 tab 轮抓」而不是「只把 all 换成 waitReceive」：
+            京东这个页面是 SPA 壳（实测 orderType 取任何值，服务端返回的 HTML 长度都是 99758，
+            完全不区分），所以**参数名对不对无法从服务端验证**，只能到 WebView 里跑才知道。
+            轮抓多个 tab 的好处是：**只要有一个 tab 名写对，新单就能抓到**，
+            不会因为猜错一个参数名而全盘失效。而且各 tab 之间靠 orderId 去重，不会重复。
+       ② 终止条件改成「连续 N 轮没有新增就停」：真正反映「已经滚到底」，
+          而不是依赖错误的 totalNum 比较。
+       ★ 超时同步放宽（见下方 60000 → 180000），因为要跑多个 tab。 */
+    private val ORDER_TABS = listOf(
+        "waitReceive",   // 待收货：新单（已揽收/运输中/派送中）基本都在这
+        "waitDeliver",   // 待出库：仓库处理中的单
+        "notShipped",    // 未发货
+        "all"            // 全部（兜底，最后跑）
+    )
+    private const val ORDER_CENTER_TPL =
+        "https://trade.m.jd.com/order/orderlist_jdm.shtml?orderType=%s&source=m_outer_jx_order"
 
     private const val HOOK_JS = """
         (function(){
@@ -67,24 +97,12 @@ object JdListFetcher {
 
     private val handler = Handler(Looper.getMainLooper())
     private val interceptClient = okhttp3.OkHttpClient.Builder().build()
-    private var scrollStarted = false
-    private var challengeShown = false
-
-    private fun tapAt(w: WebView, cssX: Float, cssY: Float) {
-        val density = w.resources.displayMetrics.density
-        val x = cssX * density
-        val y = cssY * density
-        val downTime = android.os.SystemClock.uptimeMillis()
-        val down = MotionEvent.obtain(downTime, downTime, MotionEvent.ACTION_DOWN, x, y, 0)
-        val up = MotionEvent.obtain(downTime, downTime + 60, MotionEvent.ACTION_UP, x, y, 0)
-        try {
-            w.dispatchTouchEvent(down)
-            w.dispatchTouchEvent(up)
-        } finally {
-            down.recycle()
-            up.recycle()
-        }
-    }
+    /* ★ 2026-09-28：删掉 scrollStarted / challengeShown 两个成员变量。
+       它们原来做「滚动只跑一次」「验证页只提示一次」的全局守卫，
+       多 tab 化之后滚动守卫改成了 start() 里的局部变量 everScrolled（每个 tab 各一份），
+       challengeShown 在改前就已经没有任何地方读它（只赋值不读，是死字段）。
+       留着会让下一个人以为「滚动仍然全局只跑一次」，属误导，故清掉。
+       同理 tapAt() 也没人调（原用于模拟点击搜索框，现在走 URL 直接带参数），一并删。 */
 
     fun fetch(
         act: Context,
@@ -146,8 +164,6 @@ object JdListFetcher {
         fun finish(result: List<ExpressItem>?, err: String?) {
             if (finished) return
             finished = true
-            scrollStarted = false
-            challengeShown = false
             handler.postDelayed({
                 try {
                     (w.parent as? ViewGroup)?.removeView(w)
@@ -194,6 +210,34 @@ object JdListFetcher {
             }
         }
 
+        /* ★★ 2026-09-28 多 tab 顺序抓取（本次修复的第二个关键点）。
+           ── 为什么不是「简单把 all 换成 waitReceive」──
+           京东这个页面是 SPA 壳：实测 orderType 取 all / waitReceive / waitPay / …
+           **服务端返回的 HTML 长度一模一样（都是 99758 字节）**，说明筛选完全由前端 JS 做。
+           所以「哪个 tab 参数名是对的」**无法从服务端验证**，只能到 WebView 里跑才知道。
+           ★ 轮抓多个 tab：只要有一个参数名蒙对，新单就进来了；同时靠 orderId 去重，
+             重复抓同一个 tab 不会产生重复件。这是「不赌单个参数名」的稳妥做法。
+           ── 实现 ──
+           tabIndex 逐个推进；每个 tab 进来后跑一轮 scrollAndCollect（滚到底/无新增就停），
+           然后 onTabDone 回到这里推进下一个。全部跑完才 finish。 */
+        var tabIndex = 0
+        var everScrolled = false
+
+        fun loadNextTab() {
+            if (finished) return
+            if (tabIndex >= ORDER_TABS.size) {
+                Log.i(TAG, "all tabs done: ${ORDER_TABS.size} tabs, captures=${captures.size}")
+                finish(null, null)
+                return
+            }
+            val tab = ORDER_TABS[tabIndex]
+            tabIndex++
+            everScrolled = false
+            val url = String.format(ORDER_CENTER_TPL, tab)
+            Log.i(TAG, "load tab[$tabIndex/${ORDER_TABS.size}] orderType=$tab")
+            w.loadUrl(url)
+        }
+
         w.webViewClient = object : WebViewClient() {            override fun onPageFinished(view: WebView, url: String) {
                 Log.i(TAG, "page: $url")
                 if (url.contains("plogin") || url.contains("nopasswordcmcc")) {
@@ -229,8 +273,16 @@ object JdListFetcher {
                     // 回到订单页（验证完成/直接进入）：回存最新 Cookie
                     val cookies = collectJdCookies()
                     if (cookies.isNotBlank()) saveCookies(cookies)
+                    /* ★ 每个 tab 只滚一次（everScrolled 守卫）。
+                       原来用全局 scrollStarted，只能滚第一个 tab —— 这正是
+                       「新单抓不到」的第二个成因。 */
+                    if (everScrolled) return
+                    everScrolled = true
                     handler.postDelayed({
-                        scrollAndCollect(w, captures, account, ::finish)
+                        scrollAndCollect(w, captures, account, ::finish) {
+                            // ★ 这个 tab 滚完了 → 推进下一个 tab（而不是直接 finish）
+                            handler.postDelayed({ loadNextTab() }, 1200)
+                        }
                     }, 4000)
                 }
             }
@@ -249,25 +301,51 @@ object JdListFetcher {
             w, HOOK_JS,
             setOf("https://trade.m.jd.com", "https://wqs.jd.com")
         )
-        w.loadUrl(ORDER_CENTER)
-        // 兜底超时
+        // ★ 启动第一个 tab（原来是直接 loadUrl(ORDER_CENTER)）
+        loadNextTab()
+        // 兜底超时。
+        // ★ 2026-09-28：60000 → 180000。因为现在要顺序跑 4 个 tab，
+        //   每个 tab 最多 40 轮 × 3 秒 = 120 秒，4 个 tab 理论上要 8 分钟。
+        //   但正常情况每个 tab 几轮就「无新增」收工（待收货 tab 只有几个单，一轮就到底），
+        //   实测预期 30~60 秒跑完。180 秒是防死循环的硬上限，不是预期耗时。
         handler.postDelayed({
             if (!finished) {
                 Log.w(TAG, "timeout, finalize with ${captures.size} captures")
                 finish(null, "京东列表超时（已用部分数据）")
             }
-        }, 60000)
+        }, 180000)
     }
 
     private fun scrollAndCollect(
         w: WebView,
         captures: ArrayList<String>,
         account: com.halo.expressassistant.data.BoundAccount?,
-        finish: (List<ExpressItem>?, String?) -> Unit
+        finish: (List<ExpressItem>?, String?) -> Unit,
+        /* ★ 2026-09-28 加：这个 tab 滚完后的回调。多 tab 轮抓靠它推进下一个 tab。
+           注意这里**不再直接调 finish** —— 一个 tab 滚完只是这个 tab 完事，
+           还有别的 tab 要抓。真正的结束在多 tab 都跑完之后（loadNextTab 里判 tabIndex）。 */
+        onTabDone: () -> Unit
     ) {
-        if (scrollStarted) return
-        scrollStarted = true
+        /* ★ 注意：这个函数现在会被**每个 tab 各调一次**。
+           原来的 `if (scrollStarted) return` 是全局守卫，会把第 2 个之后的 tab
+           全挡掉 —— 那正是「新单抓不到」的成因之一。
+           现在改成「每次调用独立跑完」，由外层 everScrolled 控制「每个 tab 只进一次」。 */
         var rounds = 0
+        /* ★★ 2026-09-28 终止条件重写（本次修复的核心）。
+           ── 原来的判据错在哪 ──
+           原代码：`if ((total > 0 && orders.size >= total) || rounds > 14)`
+           其中 total = body.totalNum = 账号下**全部订单数**（几百条），
+           而每轮滚动只多一页（10~20 条）。于是：
+             · `orders.size >= total` 几乎永远不成立；
+             · 真正生效的只有 `rounds > 14`（≈42 秒硬截断）。
+           ★ 后果：列表按时间倒序、旧单在前，42 秒全滚在旧单上，
+             新单（待收货）根本轮不到 → 「新单同步不进来」。
+           ── 新判据 ──
+           「连续 3 轮没有新增」= 真的滚到底了（没新数据再滚也是白滚）。
+           这个判据**不依赖 totalNum**，所以账号里有多少历史订单都不影响。
+           上限放到 40 轮（≈120 秒）纯粹是防死循环的保险丝。 */
+        var lastCount = -1
+        var noGain = 0
         val runnable = object : Runnable {
             override fun run() {
                 rounds++
@@ -293,9 +371,18 @@ object JdListFetcher {
                 }
                 val (orders, _) = convert(captures, account)
                 val total = totalNum(captures)
-                Log.i(TAG, "round=$rounds orders=${orders.size} total=$total captures=${captures.size}")
-                if ((total > 0 && orders.size >= total) || rounds > 14) {
-                    finish(orders, null)
+                /* ★ 连续无新增计数。注意判据用 orders.size（去重后的**有效件数**），
+                   不是 captures.size（原始响应条数）——
+                   翻到底之后浏览器可能仍在重复吐同一页，captures 在涨但 orders 不涨，
+                   用 captures 判会永远"有新增"而滚到上限。 */
+                if (orders.size == lastCount) noGain++ else noGain = 0
+                lastCount = orders.size
+                Log.i(TAG, "round=$rounds orders=${orders.size} total=$total " +
+                        "captures=${captures.size} noGain=$noGain")
+                if (noGain >= 3 || rounds > 40) {
+                    Log.i(TAG, "tab done: round=$rounds orders=${orders.size} noGain=$noGain")
+                    // ★ 不是 finish，是「这个 tab 完事，去下一个」
+                    onTabDone()
                     return
                 }
                 swipeUp(w)
