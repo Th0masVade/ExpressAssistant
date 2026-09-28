@@ -22,8 +22,18 @@ jobs:
           distribution: temurin
           java-version: 17
 
-      - name: Set up Android SDK
-        uses: actions/setup-android@v3
+      # ★★ 2026-09-28 换掉原来那行 `actions/setup-android@v3`。
+      #   实测报错：Unable to resolve action actions/setup-android, repository not found
+      #   —— 「actions」这个 org 下**没有** setup-android 这个 action，
+      #   真正的仓库是 `android-actions/setup-android`（org 名不同）。
+      #   ★ 用官方 runner 镜像自带的 SDK 更稳：ubuntu-latest 预装了 Android SDK
+      #     （ANDROID_HOME 已设好），连装都不用装，也少一个第三方依赖。
+      - name: Verify Android SDK
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
+          ls "$ANDROID_HOME" || true
+          ls "$ANDROID_HOME/platforms" || true
 
       - name: Grant execute permission
         run: chmod +x gradlew
