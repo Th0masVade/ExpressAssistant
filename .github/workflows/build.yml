@@ -4,6 +4,11 @@ on:
   push:
     branches: [ main, master ]
   pull_request:
+  # ★ 2026-09-28 加 workflow_dispatch。
+  #   原因：fork 仓库的 push 事件**不会自动触发** Actions（GitHub 对 fork 的安全策略），
+  #   而原 workflow 只声明了 push / pull_request，导致「推上去了但没有任何 run」。
+  #   加这一条就能用 `gh workflow run Build` 手动点火。
+  workflow_dispatch:
 
 jobs:
   build:
@@ -18,7 +23,7 @@ jobs:
           java-version: 17
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+        uses: actions/setup-android@v3
 
       - name: Grant execute permission
         run: chmod +x gradlew
