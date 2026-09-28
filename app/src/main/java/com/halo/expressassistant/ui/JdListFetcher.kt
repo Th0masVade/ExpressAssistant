@@ -196,18 +196,28 @@ object JdListFetcher {
             }, 200)
         }
 
-        /** 汇总京东主要域 Cookie（用于验证完成后回存，防每次刷新都脱线） */
+        /** 汇总京东主要域 Cookie（用于验证完成后回存，防每次刷新都脱线）
+         *  ★ 2026-09-28：补上 PC 域（trade.jd.com / order.jd.com / home.jd.com）。
+         *    原来只列了 6 个域且**全是移动域 + www.jd.com**，采不到 lsid/lstoken/s_key/s_pin，
+         *    回存后会把一套完整的登录态「洗」成半套，下次同步必然脱线。 */
         fun collectJdCookies(): String {
-            val sb = StringBuilder()
+            val out = LinkedHashMap<String, String>()
             for (host in listOf(
-                "https://www.jd.com", "https://wqs.jd.com", "https://trade.m.jd.com",
-                "https://api.m.jd.com", "https://jingfen.jd.com", "https://plogin.m.jd.com"
+                // PC 域（lsid / lstoken / s_key / s_pin 只在这里有）
+                "https://www.jd.com", "https://trade.jd.com", "https://order.jd.com", "https://home.jd.com",
+                // 移动域
+                "https://wqs.jd.com", "https://trade.m.jd.com", "https://api.m.jd.com",
+                "https://wq.jd.com", "https://home.m.jd.com", "https://jingfen.jd.com",
+                // 登录域
+                "https://plogin.m.jd.com"
             )) {
                 val c = CookieManager.getInstance().getCookie(host) ?: continue
-                if (sb.isNotEmpty()) sb.append("; ")
-                sb.append(c)
+                for (part in c.split(";")) {
+                    val kv = part.trim().split("=", limit = 2)
+                    if (kv.size == 2 && kv[0].isNotBlank() && kv[1].isNotBlank()) out[kv[0]] = kv[1]
+                }
             }
-            return sb.toString()
+            return out.entries.joinToString("; ") { "${it.key}=${it.value}" }
         }
 
         fun saveCookies(cookies: String) {
@@ -216,8 +226,24 @@ object JdListFetcher {
                 // 不能用匿名集把登录 Cookie 冲掉（曾把 11.5KB 登录集缩水成 2.5KB 导致抓取失效）
                 if (account != null) {
                     val old = Store.cookieOf(account.payload)
-                    if (old.contains("pt_key=") && !cookies.contains("pt_key=")) {
+                    val oldHasKey = old.contains("pt_key=")
+                    val newHasKey = cookies.contains("pt_key=")
+                    if (oldHasKey && !newHasKey) {
                         Log.i(TAG, "skip anon overwrite: keep login payload (${old.length})")
+                        return
+                    }
+                    /* ★★ 2026-09-28：老 payload 只有「半套登录态」时，允许被新的一套覆盖。
+                       ── 为什么会需要这条 ──
+                       老 payload 含 pt_key，但**缺 lsid/s_key**（PC 域没采到）→ 抓订单页必被跳登录。
+                       而上面那道「防降级」只认 pt_key，坏 payload 也含 pt_key，
+                       于是每次同步都「成功保留了它」，**问题被永久锁死、用户重登也没用**。
+                       ── 判据 ──
+                       只有「新的一套比旧的更完整」才允许替换（避免真的把好数据冲掉）。 */
+                    fun hasPc(c: String) = c.contains("lsid=") || c.contains("s_key=")
+                    if (oldHasKey && !hasPc(old) && hasPc(cookies)) {
+                        Log.i(TAG, "upgrade stale payload: old=${old.length} (no lsid/s_key) -> new=${cookies.length}")
+                        Store.updateAccount(act, Store.CH_JD, account.copy(payload = Store.cookiePayload(cookies)))
+                        Log.i(TAG, "jd cookies upgraded (len=${cookies.length})")
                         return
                     }
                     Store.updateAccount(act, Store.CH_JD, account.copy(payload = Store.cookiePayload(cookies)))
