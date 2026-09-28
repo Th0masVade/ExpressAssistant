@@ -49,12 +49,32 @@ object JdListFetcher {
             不会因为猜错一个参数名而全盘失效。而且各 tab 之间靠 orderId 去重，不会重复。
        ② 终止条件改成「连续 N 轮没有新增就停」：真正反映「已经滚到底」，
           而不是依赖错误的 totalNum 比较。
-       ★ 超时同步放宽（见下方 60000 → 180000），因为要跑多个 tab。 */
+
+       ── ★★ 2026-09-28 二次修正：砍掉后 3 个 tab，只留 waitReceive（提速）──
+       【上一版的问题】上一版写了 4 个 tab 轮抓（waitReceive / waitDeliver / notShipped / all），
+         当时的理由是「SPA 壳无法验证参数名，多抓几个『只要有一个蒙对就行』」。
+         这个理由在「还不知道哪个名字对」的阶段是合理的，但**现在已经知道答案了**。
+       【实测证据（两次独立测量，日志级）】
+         第 1 次（18:31）：
+           load tab[1/4] orderType=waitReceive → round=1..27 → tab done: orders=181  ← tab1 结束就已 181 条
+           load tab[2/4] orderType=waitDeliver → tab done: round=4 orders=181 noGain=3 ← 0 新增
+           load tab[3/4] orderType=notShipped  → tab done: round=4 orders=181 noGain=3 ← 0 新增
+           load tab[4/4] orderType=all         → tab done: round=4 orders=181 noGain=3 ← 0 新增
+         第 2 次（18:32）完全复现同样结果。
+         ★ 结论：**waitReceive 一个 tab 就拿到全部 181 条**，后 3 个 tab 贡献 0，
+           却各自要跑 4 轮 × 3 秒 ≈ 12 秒，合计白白多花 ~45 秒。
+       【顺带纠正一个认知】waitReceive 并不只返回「待收货」——
+         实测它返回的 orderList 里 orderStatusName 有「完成 / 请上门自提 / 处理成功」三种，
+         说明服务端在这个 tab 下给的是一份**宽口径列表**（含历史已完成单）。
+         所以「砍了 waitReceive 之外的 tab 会漏单」这个担心不成立：
+         177 条已完成 + 4 条在途全部由 waitReceive 命中。
+       【保留的兜底】`all` 曾作为「最全」的兜底，但实测它与 waitReceive 结果重合，
+         且它排在最后、跑到时早已被去重掏空，纯属耗时。故一并移除。
+         ★ 若日后发现某类单抓不到，恢复方式很简单：往 ORDER_TABS 里加回名字即可，
+           多 tab 的去重（convert 里按 orderId 的 LinkedHashMap）和终止条件都还支持多 tab。 */
     private val ORDER_TABS = listOf(
-        "waitReceive",   // 待收货：新单（已揽收/运输中/派送中）基本都在这
-        "waitDeliver",   // 待出库：仓库处理中的单
-        "notShipped",    // 未发货
-        "all"            // 全部（兜底，最后跑）
+        // 待收货：实测覆盖全部订单（含历史完成单），是唯一必要的入口
+        "waitReceive"
     )
     private const val ORDER_CENTER_TPL =
         "https://trade.m.jd.com/order/orderlist_jdm.shtml?orderType=%s&source=m_outer_jx_order"
@@ -304,16 +324,18 @@ object JdListFetcher {
         // ★ 启动第一个 tab（原来是直接 loadUrl(ORDER_CENTER)）
         loadNextTab()
         // 兜底超时。
-        // ★ 2026-09-28：60000 → 180000。因为现在要顺序跑 4 个 tab，
-        //   每个 tab 最多 40 轮 × 3 秒 = 120 秒，4 个 tab 理论上要 8 分钟。
-        //   但正常情况每个 tab 几轮就「无新增」收工（待收货 tab 只有几个单，一轮就到底），
-        //   实测预期 30~60 秒跑完。180 秒是防死循环的硬上限，不是预期耗时。
+        // ★ 2026-09-28：180000 → 120000。原来设 180 秒是因为要顺序跑 4 个 tab
+        //   （每个最多 40 轮 × 3 秒 = 120 秒，4 个 tab 理论上 8 分钟）。
+        //   现在只跑 1 个 tab 了，理论上限就是 40 轮 × 3 秒 = 120 秒，
+        //   所以 120 秒即是「单 tab 跑满上限」的硬顶，不会再被 4 个 tab 累加突破。
+        //   ★ 实测正常耗时：waitReceive 抓到全部 181 条用 27 轮 ≈ 81 秒；
+        //     若账号单少（几轮就 noGain 收工）会更短，常见 12~30 秒。
         handler.postDelayed({
             if (!finished) {
                 Log.w(TAG, "timeout, finalize with ${captures.size} captures")
                 finish(null, "京东列表超时（已用部分数据）")
             }
-        }, 180000)
+        }, 120000)
     }
 
     private fun scrollAndCollect(

@@ -50,6 +50,8 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+// ★ 2026-09-28：后台任务超时保护用（refreshAllDetails / backfill / optimizeShortNames）
+import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.encodeToString
 import org.json.JSONObject
 import java.text.SimpleDateFormat
@@ -65,6 +67,18 @@ class MainActivity : AppCompatActivity() {
     private var appliedTheme: String = ""
 
     private var quickActionsExpanded = false
+
+    /* ★ 2026-09-28 刷圈看门狗（详见 syncAll 里的注释）。
+       作用：同步启动后挂一个 60 秒的强制停圈回调，防止后台任务卡死导致刷圈永不停。
+       同步正常收尾时会 removeCallbacks 并置 null。 */
+    private var spinnerWatchdog: Runnable? = null
+
+    override fun onDestroy() {
+        // ★ 防止 Activity 销毁后看门狗回调仍持有 binding 造成泄漏 / 崩溃
+        spinnerWatchdog?.let { binding.root.removeCallbacks(it) }
+        spinnerWatchdog = null
+        super.onDestroy()
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         Themes.apply(this)
@@ -453,8 +467,39 @@ class MainActivity : AppCompatActivity() {
                     if (!spinnerStopped) {
                         spinnerStopped = true
                         binding.swipeRefresh.isRefreshing = false
+                        spinnerWatchdog?.let { binding.root.removeCallbacks(it) }
+                        spinnerWatchdog = null
                     }
                 }
+                /* ★★ 2026-09-28 加「刷圈看门狗」（用户实测报告：刷圈一直转不停）。
+                   ── 现象 ──
+                   用户看到下拉刷新的圆圈一直转，转了好几分钟不停；实测进程 CPU 30%、
+                   内存持续涨，但 JdListFetcher 日志早已停止输出。
+                   ── 根因 ──
+                   syncAll 用 `finally { binding.swipeRefresh.isRefreshing = false }` 停圈，
+                   而这个 finally **要等整段协程跑完**才执行。协程末尾串了三个后台任务：
+                     · refreshAllDetails() —— 逐件拉小米详情（网络请求，无超时）
+                     · PddTraceBackfill.backfill(force=true) —— 只 delay 节流，无 withTimeout
+                     · SyncEngine.optimizeShortNames() —— 无超时
+                   这三个都**没有超时保护**，只要任一网络请求挂住，协程永不结束
+                   → finally 永不执行 → 圈永远转。
+                   （实测触发场景：京东 Cookie 失效导致抓取返回空批次，
+                     空批次又让流式回调里的 stopSpinnerIfNeeded() 整个被跳过，
+                     于是没有任何一处能停圈。）
+                   ── 修法 ──
+                   1) 加一个 handler 看门狗：启动同步时挂一个 60 秒的强制停圈回调，
+                      无论后台任务卡多久，到点必停（数据早已落库，停圈不影响正确性）。
+                   2) 正常路径停圈时 removeCallbacks 撤掉看门狗，避免误触发。
+                   ★ 判据：刷圈只是「进行中」的视觉提示，它的正确性下限是「不要卡住用户」，
+                     而不是「必须等到所有后台任务结束」——后者本来就该静默后台跑。 */
+                spinnerWatchdog = Runnable {
+                    if (!spinnerStopped) {
+                        spinnerStopped = true
+                        binding.swipeRefresh.isRefreshing = false
+                        Log.w("MainActivity", "spinner watchdog fired (后台任务超 60s 未收尾)")
+                    }
+                }
+                binding.root.postDelayed(spinnerWatchdog!!, 60_000)
                 // 流式：拼多多每增量一批新单 → 立刻入库+刷新（总件数实时上涨）；
                 // 首批到达即停止下拉转圈（在途/完成第一页4件/异常第一页4件已可显示）
                 // 已移除单号快照：流式增量入库同样跳过，防「移除后下次刷新复活」
@@ -493,7 +538,18 @@ class MainActivity : AppCompatActivity() {
                 // 不再拖着转圈等它们（反馈：转圈要到「所有包裹包括已完成」刷完才停）
                 stopSpinnerIfNeeded()
                 // 下拉刷新只报告「在途包裹」刷新状态；完成/异常后台静默加载，不提示
-                refreshAllDetails()
+                /* ★ 2026-09-28：给三个后台任务加独立超时。
+                   原来它们直连串行，任一网络请求挂住就拖死整个协程（→ finally 不执行 → 刷圈不停）。
+                   现在各自 withTimeout，超时只放弃该子任务、不阻断后续流程。
+                   超时值取「够用但不至于长到让用户以为卡死」：
+                     · refreshAllDetails 只对小米逐件拉详情，单次 20s 上限足够
+                     · backfill 是回填缓存 + 补抓过期单，30s
+                     · optimizeShortNames 走 AI 短名，最慢，给 45s */
+                try {
+                    withTimeout(20_000) { refreshAllDetails() }
+                } catch (e: Throwable) {
+                    Log.w("MainActivity", "refreshAllDetails timeout/skip: ${e.message}")
+                }
                 val transportCount = Store.items(this@MainActivity).count { isTransportItem(it) }
                 android.widget.Toast.makeText(
                     this@MainActivity,
@@ -502,10 +558,18 @@ class MainActivity : AppCompatActivity() {
                 ).show()
                 reload()
                 // 同步完成后强制立刻补抓（回填已抓缓存到卡片 + 补抓过期单），防轨迹外显被同步覆盖丢失
-                PddTraceBackfill.backfill(this@MainActivity, this, force = true)
+                try {
+                    withTimeout(30_000) { PddTraceBackfill.backfill(this@MainActivity, this, force = true) }
+                } catch (e: Throwable) {
+                    Log.w("MainActivity", "backfill timeout/skip: ${e.message}")
+                }
                 // 后台优化卡片短名：每小批 AI 结果出来就落库+立即刷新（渐进式外显，不等整批）
                 CoroutineScope(Dispatchers.Main).launch {
-                    SyncEngine.optimizeShortNames(this@MainActivity) { reload() }
+                    try {
+                        withTimeout(45_000) { SyncEngine.optimizeShortNames(this@MainActivity) { reload() } }
+                    } catch (e: Throwable) {
+                        Log.w("MainActivity", "optimizeShortNames timeout/skip: ${e.message}")
+                    }
                 }
             } catch (e: Throwable) {
                 android.widget.Toast.makeText(this@MainActivity, e.message ?: "同步失败", android.widget.Toast.LENGTH_LONG).show()
@@ -606,7 +670,14 @@ class MainActivity : AppCompatActivity() {
         CoroutineScope(Dispatchers.Main).launch {
             try {
                 SyncEngine.sync(this@MainActivity, skip)
-                refreshAllDetails()
+                /* ★ 2026-09-28：与 syncAll 同样的原因加超时。
+                   这里虽然不涉及刷圈（后台静默同步），但 refreshAllDetails 是逐件网络请求，
+                   无超时时一旦挂住，协程会一直占着不放（实测进程 CPU 30%、内存持续涨）。 */
+                try {
+                    withTimeout(20_000) { refreshAllDetails() }
+                } catch (e: Throwable) {
+                    Log.w("MainActivity", "auto refreshAllDetails timeout/skip: ${e.message}")
+                }
                 reload()
             } catch (e: Throwable) {
                 // 静默失败，用户手动同步时会看到提示
