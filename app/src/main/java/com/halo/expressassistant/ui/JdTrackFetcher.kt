@@ -9,6 +9,7 @@ import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import com.halo.expressassistant.api.JdCookieInject
 import com.halo.expressassistant.data.DetailPoint
 import com.halo.expressassistant.data.ExpressDetail
 import com.halo.expressassistant.data.ExpressItem
@@ -69,15 +70,10 @@ object JdTrackFetcher {
         val cm = CookieManager.getInstance()
         cm.setAcceptCookie(true)
         cm.setAcceptThirdPartyCookies(w, true)
-        for (part in jdCookies.split(";")) {
-            val kv = part.trim().split("=", limit = 2)
-            if (kv.size == 2 && kv[0].isNotBlank()) {
-                cm.setCookie("https://www.jd.com", "${kv[0]}=${kv[1]}")
-                cm.setCookie("https://trade.m.jd.com", "${kv[0]}=${kv[1]}")
-                cm.setCookie("https://api.m.jd.com", "${kv[0]}=${kv[1]}")
-            }
-        }
-        cm.flush()
+        // ★ 2026-10-03：改用统一注入器。原来只塞 5 个移动域，
+        //   漏掉 trade.jd.com / order.jd.com（PC 域）→ 订单页必被跳登录。
+        //   详见 api/JdCookieInject.kt 的说明。
+        JdCookieInject.inject(jdCookies)
         try {
             val decor = act.window.decorView as? ViewGroup
             decor?.addView(w, 0, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))

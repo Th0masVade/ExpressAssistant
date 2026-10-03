@@ -17,6 +17,7 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.LinearLayout
 import android.widget.TextView
+import com.halo.expressassistant.api.JdCookieInject
 import com.halo.expressassistant.data.Store
 
 /**
@@ -144,17 +145,8 @@ class JdTraceActivity : Activity() {
         if (jdCookies.isBlank()) {
             append("⚠️ 没有京东登录态，先去设置里做「京东登录」\n")
         } else {
-            for (part in jdCookies.split(";")) {
-                val kv = part.trim().split("=", limit = 2)
-                if (kv.size == 2 && kv[0].isNotBlank()) {
-                    cm.setCookie("https://www.jd.com", "${kv[0]}=${kv[1]}")
-                    cm.setCookie("https://jingfen.jd.com", "${kv[0]}=${kv[1]}")
-                    cm.setCookie("https://u.jd.com", "${kv[0]}=${kv[1]}")
-                    cm.setCookie("https://trade.m.jd.com", "${kv[0]}=${kv[1]}")
-                    cm.setCookie("https://wqs.jd.com", "${kv[0]}=${kv[1]}")
-                    cm.setCookie("https://api.m.jd.com", "${kv[0]}=${kv[1]}")
-                }
-            }
+            // ★ 2026-10-03：改用统一注入器（补齐 trade.jd.com / order.jd.com 等 PC 域）。
+            JdCookieInject.inject(jdCookies)
             cm.flush()
             append("已注入京东 cookie（${jdCookies.split(";").count { it.isNotBlank() }} 条）\n")
         }

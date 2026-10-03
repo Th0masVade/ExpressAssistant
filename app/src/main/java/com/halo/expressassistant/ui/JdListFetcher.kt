@@ -14,6 +14,7 @@ import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import com.halo.expressassistant.api.JdCookieInject
 import com.halo.expressassistant.data.ExpressItem
 import com.halo.expressassistant.data.JdGoods
 import com.halo.expressassistant.data.Store
@@ -163,17 +164,12 @@ object JdListFetcher {
         cm.setAcceptCookie(true)
         cm.setAcceptThirdPartyCookies(w, true)
         val jdCookies = account?.let { Store.cookieOf(it.payload) } ?: Store.jdCookies(act)
-        for (part in jdCookies.split(";")) {
-            val kv = part.trim().split("=", limit = 2)
-            if (kv.size == 2 && kv[0].isNotBlank()) {
-                cm.setCookie("https://www.jd.com", "${kv[0]}=${kv[1]}")
-                cm.setCookie("https://wqs.jd.com", "${kv[0]}=${kv[1]}")
-                cm.setCookie("https://trade.m.jd.com", "${kv[0]}=${kv[1]}")
-                cm.setCookie("https://api.m.jd.com", "${kv[0]}=${kv[1]}")
-                cm.setCookie("https://jingfen.jd.com", "${kv[0]}=${kv[1]}")
-            }
-        }
-        cm.flush()
+        // ★ 2026-10-03：改用统一注入器。原来只往 5 个**移动域**塞 cookie，
+        //   漏掉 trade.jd.com / order.jd.com / home.jd.com（PC 域），
+        //   而 lsid / lstoken / s_key / s_pin 恰恰只在 PC 域有效 →
+        //   加载订单页时 WebView 里没有完整登录态 → 被跳 plogin → captures=0。
+        //   详见 api/JdCookieInject.kt 的完整说明。
+        JdCookieInject.inject(jdCookies)
         try {
             val decor = (act as? Activity)?.window?.decorView as? ViewGroup
             decor?.addView(w, 0, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))

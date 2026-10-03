@@ -11,6 +11,7 @@ import android.webkit.CookieManager
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import com.halo.expressassistant.api.JdCookieInject
 import com.halo.expressassistant.data.JdGoods
 import com.halo.expressassistant.data.Store
 
@@ -77,17 +78,10 @@ object JdOrderResolver {
         val cm = CookieManager.getInstance()
         cm.setAcceptCookie(true)
         cm.setAcceptThirdPartyCookies(w, true)
-        for (part in jdCookies.split(";")) {
-            val kv = part.trim().split("=", limit = 2)
-            if (kv.size == 2 && kv[0].isNotBlank()) {
-                cm.setCookie("https://www.jd.com", "${kv[0]}=${kv[1]}")
-                cm.setCookie("https://wqs.jd.com", "${kv[0]}=${kv[1]}")
-                cm.setCookie("https://trade.m.jd.com", "${kv[0]}=${kv[1]}")
-                cm.setCookie("https://api.m.jd.com", "${kv[0]}=${kv[1]}")
-                cm.setCookie("https://jingfen.jd.com", "${kv[0]}=${kv[1]}")
-            }
-        }
-        cm.flush()
+        // ★ 2026-10-03：改用统一注入器。原来只塞 5 个移动域，
+        //   漏掉 trade.jd.com / order.jd.com（PC 域）→ 订单页必被跳登录。
+        //   详见 api/JdCookieInject.kt 的说明。
+        JdCookieInject.inject(jdCookies)
         // 隐藏挂载到 decor 底部：拿到真实布局尺寸，但不遮挡界面、不抢触摸
         try {
             val decor = act.window.decorView as? ViewGroup
